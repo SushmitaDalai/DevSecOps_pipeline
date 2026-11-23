@@ -1,0 +1,34 @@
+name: EKS CD
+on:
+  workflow_dispatch:
+    inputs:
+      image_digest:
+        description: 'Approved ECR image digest, sha256:...'
+        required: true
+        type: string
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_CD_ROLE_ARN }}
+          aws-region: ap-south-1
+      - name: Configure EKS access
+        run: aws eks update-kubeconfig --name "${{ vars.EKS_CLUSTER }}" --region ap-south-1
+      - name: Validate and deploy
+        env:
+          DIGEST: ${{ inputs.image_digest }}
+          REPOSITORY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.ap-south-1.amazonaws.com/python-demo
+        run: |
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          helm lint helm
+          helm template python-demo helm --set-string image.repository="$REPOSITORY" --set-string image.digest="$DIGEST" > /tmp/rendered.yaml
+          helm upgrade --install python-demo helm --namespace python-demo --create-namespace --set-string image.repository="$REPOSITORY" --set-string image.digest="$DIGEST" --atomic --wait --timeout 5m
+          kubectl rollout status deployment/python-demo -n python-demo --timeout=180s

@@ -1,0 +1,69 @@
+pipeline {
+  agent { label 'docker-aws-tools' }
+  options { timestamps(); disableConcurrentBuilds() }
+  environment {
+    AWS_REGION = 'ap-south-1'
+    ECR_REPOSITORY = 'python-demo'
+    SONARQUBE_ENV = 'sonarqube'
+  }
+  stages {
+    stage('Checkout') { steps { checkout scm } }
+    stage('Tag') {
+      steps { script {
+        def branch = (env.BRANCH_NAME ?: 'main').toLowerCase().replaceAll('[^a-z0-9_.-]', '-').take(80)
+        env.IMAGE_TAG = "${branch}-${env.GIT_COMMIT.take(12)}"
+      } }
+    }
+    stage('Lint and Unit Tests') {
+      steps { sh '''
+        python3 -m venv .venv
+        .venv/bin/pip install -r requirements-dev.txt
+        .venv/bin/ruff check .
+        .venv/bin/ruff format --check .
+        mkdir -p reports
+        .venv/bin/pytest --junitxml=reports/junit.xml --cov=app --cov-report=xml:reports/coverage.xml --cov-fail-under=80
+      ''' }
+      post { always { junit allowEmptyResults: true, testResults: 'reports/junit.xml' } }
+    }
+    stage('Trivy Secret Scan') {
+      steps { sh 'trivy fs --scanners secret --exit-code 1 --format json --output reports/trivy-secrets.json .' }
+    }
+    stage('OWASP Dependency-Check SCA') {
+      steps { sh 'dependency-check.sh --project python-demo --scan . --format JSON --out reports --failOnCVSS 7' }
+    }
+    stage('SonarQube SAST') {
+      steps { withSonarQubeEnv('sonarqube') { sh 'sonar-scanner' } }
+    }
+    stage('Sonar Quality Gate') {
+      steps { timeout(time: 10, unit: 'MINUTES') { waitForQualityGate abortPipeline: true } }
+    }
+    stage('Build Image') { steps { sh 'docker build -t python-demo:${IMAGE_TAG} .' } }
+    stage('Trivy Image Vulnerability Scan') {
+      steps { sh '''
+        mkdir -p reports
+        trivy image --scanners vuln --severity HIGH,CRITICAL --exit-code 1 \
+          --format json --output reports/trivy-image.json "python-demo:${IMAGE_TAG}"
+      ''' }
+    }
+    stage('ECR Login, Tag and Push (main only)') {
+      when { branch 'main' }
+      steps { withCredentials([string(credentialsId: 'aws-account-id', variable: 'ACCOUNT_ID')]) { sh '''
+        set -eu
+        REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+        aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$REGISTRY"
+        IMAGE="${REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+        docker tag "python-demo:${IMAGE_TAG}" "$IMAGE"
+        docker push "$IMAGE"
+        aws ecr describe-images --repository-name "$ECR_REPOSITORY" --image-ids imageTag="$IMAGE_TAG" --query 'imageDetails[0].imageDigest' --output text > image-digest.txt
+      ''' } }
+    }
+    stage('Security Findings Export') {
+      when { branch 'main' }
+      steps { echo 'Reports are archived locally. DefectDojo imports and Security Hub finding ingestion require separate authenticated integration; they are NOT implemented in this starter.' }
+    }
+  }
+  post {
+    always { archiveArtifacts artifacts: 'reports/**/*,image-digest.txt', allowEmptyArchive: true } }
+    cleanup { cleanWs() }
+  }
+}

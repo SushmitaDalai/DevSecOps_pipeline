@@ -1,0 +1,6 @@
+replicaCount: 2
+image:
+  repository: "123456789012.dkr.ecr.ap-south-1.amazonaws.com/python-demo"
+  digest: "sha256:REPLACE_WITH_CI_DIGEST"
+service:
+  port: 80
